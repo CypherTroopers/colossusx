@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -19,44 +20,140 @@ import (
 )
 
 const (
-	NodeSize = 64
+	DefaultDAGMiB      = 256
+	DefaultReadsPerH   = 64
+	DefaultNodeSize    = 64
+	DefaultEpochBlocks = 8000
 )
 
-type Config struct {
+type Spec struct {
 	DAGSizeBytes uint64
+	NodeSize     uint64
 	ReadsPerHash uint64
-	Workers      int
+	EpochBlocks  uint64
 }
 
-type Result struct {
-	Nonce      uint64
-	Hash256Hex string
-	Hash512Hex string
-	Elapsed    time.Duration
-	Hashes     uint64
+func (s Spec) Validate() error {
+	if s.DAGSizeBytes == 0 {
+		return errors.New("dag size must be > 0")
+	}
+	if s.NodeSize != 64 {
+		return errors.New("this research spec currently requires 64-byte nodes")
+	}
+	if s.ReadsPerHash == 0 {
+		return errors.New("reads/hash must be > 0")
+	}
+	if s.DAGSizeBytes%s.NodeSize != 0 {
+		return fmt.Errorf("dag size must be multiple of node size (%d)", s.NodeSize)
+	}
+	return nil
+}
+
+func (s Spec) NodeCount() uint64 {
+	return s.DAGSizeBytes / s.NodeSize
+}
+
+type DAG struct {
+	spec Spec
+	buf  []byte // contiguous buffer, unified-memory-friendly layout
+}
+
+func NewDAG(spec Spec) (*DAG, error) {
+	if err := spec.Validate(); err != nil {
+		return nil, err
+	}
+	return &DAG{
+		spec: spec,
+		buf:  make([]byte, spec.DAGSizeBytes),
+	}, nil
+}
+
+func (d *DAG) NodeCount() uint64 {
+	return d.spec.NodeCount()
+}
+
+func (d *DAG) Node(i uint64) []byte {
+	off := i * d.spec.NodeSize
+	return d.buf[off : off+d.spec.NodeSize]
+}
+
+func (d *DAG) Bytes() []byte {
+	return d.buf
+}
+
+type Target [32]byte
+
+func ParseTargetHex(s string) (Target, error) {
+	var t Target
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return t, err
+	}
+	if len(b) != 32 {
+		return t, fmt.Errorf("target must be exactly 32 bytes, got %d", len(b))
+	}
+	copy(t[:], b)
+	return t, nil
+}
+
+func (t Target) String() string {
+	return hex.EncodeToString(t[:])
+}
+
+type HashResult struct {
+	Pow256 [32]byte
+	Full512 [64]byte
+}
+
+type MineResult struct {
+	Nonce       uint64
+	Hashes      uint64
+	Elapsed     time.Duration
+	HashRate    float64
+	Hash256Hex  string
+	Hash512Hex  string
+}
+
+type Miner struct {
+	spec    Spec
+	dag     *DAG
+	workers int
+}
+
+func NewMiner(spec Spec, dag *DAG, workers int) *Miner {
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	return &Miner{
+		spec:    spec,
+		dag:     dag,
+		workers: workers,
+	}
 }
 
 func main() {
 	var (
-		dagMiB       = flag.Uint64("dag-mib", 256, "DAG size in MiB")
-		reads        = flag.Uint64("reads", 64, "random DAG reads per hash")
-		workers      = flag.Int("workers", runtime.NumCPU(), "number of mining workers")
-		headerHex    = flag.String("header", "434f4c4f535355532d582d544553542d4845414445522d303031", "block header bytes in hex")
+		dagMiB       = flag.Uint64("dag-mib", DefaultDAGMiB, "DAG size in MiB")
+		reads        = flag.Uint64("reads", DefaultReadsPerH, "random DAG reads per hash")
+		workers      = flag.Int("workers", runtime.NumCPU(), "mining worker count")
+		epochBlocks  = flag.Uint64("epoch-blocks", DefaultEpochBlocks, "blocks per epoch")
+		headerHex    = flag.String("header", "434f4c4f535355532d582d544553542d4845414445522d303031", "header bytes in hex")
 		epochSeedHex = flag.String("epoch-seed", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff", "epoch seed in hex")
-		targetHex    = flag.String("target", "0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "32-byte big-endian target hex")
-		startNonce   = flag.Uint64("start-nonce", 0, "start nonce")
-		maxNonces    = flag.Uint64("max-nonces", 0, "0 = unbounded search")
+		targetHex    = flag.String("target", "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "32-byte big-endian target hex")
+		startNonce   = flag.Uint64("start-nonce", 0, "starting nonce")
+		maxNonces    = flag.Uint64("max-nonces", 200000, "0 = unbounded")
+		benchOnly    = flag.Bool("bench", false, "benchmark hash loop only")
 	)
 	flag.Parse()
 
-	if *dagMiB == 0 {
-		log.Fatal("dag-mib must be > 0")
+	spec := Spec{
+		DAGSizeBytes: (*dagMiB) * 1024 * 1024,
+		NodeSize:     DefaultNodeSize,
+		ReadsPerHash: *reads,
+		EpochBlocks:  *epochBlocks,
 	}
-	if *reads == 0 {
-		log.Fatal("reads must be > 0")
-	}
-	if *workers <= 0 {
-		log.Fatal("workers must be > 0")
+	if err := spec.Validate(); err != nil {
+		log.Fatal(err)
 	}
 
 	header, err := hex.DecodeString(*headerHex)
@@ -67,38 +164,41 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid epoch-seed hex: %v", err)
 	}
-	target, err := parseTarget(*targetHex)
+	target, err := ParseTargetHex(*targetHex)
 	if err != nil {
-		log.Fatalf("invalid target hex: %v", err)
+		log.Fatalf("invalid target: %v", err)
 	}
 
-	cfg := Config{
-		DAGSizeBytes: (*dagMiB) * 1024 * 1024,
-		ReadsPerHash: *reads,
-		Workers:      *workers,
+	fmt.Println("COLOSSUS-X research miner (unified-memory-oriented layout)")
+	fmt.Printf("dag: %d MiB\n", spec.DAGSizeBytes/(1024*1024))
+	fmt.Printf("node size: %d bytes\n", spec.NodeSize)
+	fmt.Printf("node count: %d\n", spec.NodeCount())
+	fmt.Printf("reads/hash: %d\n", spec.ReadsPerHash)
+	fmt.Printf("epoch blocks: %d\n", spec.EpochBlocks)
+	fmt.Printf("workers: %d\n", *workers)
+	fmt.Printf("target: %s\n", target.String())
+
+	dag, err := NewDAG(spec)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	if cfg.DAGSizeBytes%NodeSize != 0 {
-		log.Fatalf("dag size must be multiple of %d bytes", NodeSize)
+	genStart := time.Now()
+	if err := GenerateDAG(dag, epochSeed, *workers); err != nil {
+		log.Fatalf("generate dag: %v", err)
+	}
+	fmt.Printf("dag generated in %s\n", time.Since(genStart).Round(time.Millisecond))
+
+	miner := NewMiner(spec, dag, *workers)
+
+	if *benchOnly {
+		Benchmark(miner, header, *startNonce, *maxNonces)
+		return
 	}
 
-	fmt.Printf("COLOSSUS-X research miner\n")
-	fmt.Printf("dag: %d MiB\n", cfg.DAGSizeBytes/(1024*1024))
-	fmt.Printf("node size: %d bytes\n", NodeSize)
-	fmt.Printf("reads/hash: %d\n", cfg.ReadsPerHash)
-	fmt.Printf("workers: %d\n", cfg.Workers)
-	fmt.Printf("header: %x\n", header)
-	fmt.Printf("epoch seed: %x\n", epochSeed)
-	fmt.Printf("target: %x\n", target[:])
-
-	start := time.Now()
-	dag := make([]byte, cfg.DAGSizeBytes)
-	generateDAG(dag, epochSeed, cfg.Workers)
-	fmt.Printf("dag generated in %s\n", time.Since(start).Round(time.Millisecond))
-
-	res, ok := mine(header, target, dag, cfg, *startNonce, *maxNonces)
+	res, ok := miner.Mine(header, target, *startNonce, *maxNonces)
 	if !ok {
-		fmt.Println("no solution found in search range")
+		fmt.Println("no solution found in range")
 		os.Exit(1)
 	}
 
@@ -107,40 +207,33 @@ func main() {
 	fmt.Printf("hash256: %s\n", res.Hash256Hex)
 	fmt.Printf("hash512: %s\n", res.Hash512Hex)
 	fmt.Printf("elapsed: %s\n", res.Elapsed.Round(time.Millisecond))
-	if res.Elapsed > 0 {
-		fmt.Printf("hashrate: %.2f H/s\n", float64(res.Hashes)/res.Elapsed.Seconds())
-	}
+	fmt.Printf("hashes: %d\n", res.Hashes)
+	fmt.Printf("hashrate: %.2f H/s\n", res.HashRate)
 }
 
-func parseTarget(s string) ([32]byte, error) {
-	var out [32]byte
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		return out, err
+func GenerateDAG(dag *DAG, epochSeed []byte, workers int) error {
+	if len(epochSeed) == 0 {
+		return errors.New("epoch seed cannot be empty")
 	}
-	if len(b) != 32 {
-		return out, fmt.Errorf("target must be exactly 32 bytes, got %d", len(b))
+	if workers <= 0 {
+		workers = runtime.NumCPU()
 	}
-	copy(out[:], b)
-	return out, nil
-}
 
-func generateDAG(dag []byte, epochSeed []byte, workers int) {
-	nodeCount := uint64(len(dag) / NodeSize)
-
-	var wg sync.WaitGroup
+	nodeCount := dag.NodeCount()
 	chunk := nodeCount / uint64(workers)
 	if chunk == 0 {
 		chunk = 1
 	}
 
+	var wg sync.WaitGroup
+
 	for w := 0; w < workers; w++ {
-		start := uint64(w) * chunk
-		end := start + chunk
-		if w == workers-1 || end > nodeCount {
-			end = nodeCount
+		from := uint64(w) * chunk
+		to := from + chunk
+		if w == workers-1 || to > nodeCount {
+			to = nodeCount
 		}
-		if start >= nodeCount {
+		if from >= nodeCount {
 			break
 		}
 
@@ -148,44 +241,45 @@ func generateDAG(dag []byte, epochSeed []byte, workers int) {
 		go func(from, to uint64) {
 			defer wg.Done()
 
-			buf := make([]byte, len(epochSeed)+8)
-			copy(buf, epochSeed)
+			tmp := make([]byte, len(epochSeed)+8)
+			copy(tmp, epochSeed)
 
 			for i := from; i < to; i++ {
-				binary.LittleEndian.PutUint64(buf[len(epochSeed):], i)
-				sum := sha3.Sum512(buf)
-				copy(dag[i*NodeSize:(i+1)*NodeSize], sum[:])
+				binary.LittleEndian.PutUint64(tmp[len(epochSeed):], i)
+				sum := sha3.Sum512(tmp)
+				copy(dag.Node(i), sum[:])
 			}
-		}(start, end)
+		}(from, to)
 	}
 
 	wg.Wait()
+	return nil
 }
 
-func mine(header []byte, target [32]byte, dag []byte, cfg Config, startNonce uint64, maxNonces uint64) (Result, bool) {
+func (m *Miner) Mine(header []byte, target Target, startNonce, maxNonces uint64) (MineResult, bool) {
 	start := time.Now()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var totalHashes atomic.Uint64
 	var found atomic.Bool
 
-	type foundResult struct {
-		nonce   uint64
-		hash256 [32]byte
-		hash512 [64]byte
+	type foundMsg struct {
+		nonce uint64
+		hash  HashResult
 	}
-	resultCh := make(chan foundResult, 1)
+	resultCh := make(chan foundMsg, 1)
 
 	var wg sync.WaitGroup
 
-	for wid := 0; wid < cfg.Workers; wid++ {
+	for wid := 0; wid < m.workers; wid++ {
 		wg.Add(1)
 
 		go func(workerID int) {
 			defer wg.Done()
 
-			step := uint64(cfg.Workers)
+			step := uint64(m.workers)
 			nonce := startNonce + uint64(workerID)
 
 			for {
@@ -200,16 +294,12 @@ func mine(header []byte, target [32]byte, dag []byte, cfg Config, startNonce uin
 					}
 				}
 
-				hash256, hash512 := latticeHash(header, nonce, dag, cfg)
+				h := LatticeHash(header, nonce, m.dag)
 				totalHashes.Add(1)
 
-				if lessOrEqualBE(hash256, target) {
+				if LessOrEqualBE(h.Pow256, target) {
 					if found.CompareAndSwap(false, true) {
-						resultCh <- foundResult{
-							nonce:   nonce,
-							hash256: hash256,
-							hash512: hash512,
-						}
+						resultCh <- foundMsg{nonce: nonce, hash: h}
 						cancel()
 					}
 					return
@@ -228,48 +318,76 @@ func mine(header []byte, target [32]byte, dag []byte, cfg Config, startNonce uin
 		close(resultCh)
 	}()
 
-	r, ok := <-resultCh
+	msg, ok := <-resultCh
 	if !ok {
-		return Result{}, false
+		return MineResult{}, false
 	}
 
-	return Result{
-		Nonce:      r.nonce,
-		Hash256Hex: hex.EncodeToString(r.hash256[:]),
-		Hash512Hex: hex.EncodeToString(r.hash512[:]),
-		Elapsed:    time.Since(start),
-		Hashes:     totalHashes.Load(),
+	elapsed := time.Since(start)
+	hashes := totalHashes.Load()
+	var hashrate float64
+	if elapsed > 0 {
+		hashrate = float64(hashes) / elapsed.Seconds()
+	}
+
+	return MineResult{
+		Nonce:      msg.nonce,
+		Hashes:     hashes,
+		Elapsed:    elapsed,
+		HashRate:   hashrate,
+		Hash256Hex: hex.EncodeToString(msg.hash.Pow256[:]),
+		Hash512Hex: hex.EncodeToString(msg.hash.Full512[:]),
 	}, true
 }
 
-func latticeHash(header []byte, nonce uint64, dag []byte, cfg Config) ([32]byte, [64]byte) {
-	var zero32 [32]byte
-	var zero64 [64]byte
-
-	nodeCount := uint64(len(dag) / NodeSize)
-	if nodeCount == 0 {
-		return zero32, zero64
+func Benchmark(m *Miner, header []byte, startNonce, maxNonces uint64) {
+	if maxNonces == 0 {
+		maxNonces = 100000
 	}
 
+	start := time.Now()
+	for i := uint64(0); i < maxNonces; i++ {
+		_ = LatticeHash(header, startNonce+i, m.dag)
+	}
+	elapsed := time.Since(start)
+
+	fmt.Println("benchmark complete")
+	fmt.Printf("hashes: %d\n", maxNonces)
+	fmt.Printf("elapsed: %s\n", elapsed.Round(time.Millisecond))
+	fmt.Printf("hashrate: %.2f H/s\n", float64(maxNonces)/elapsed.Seconds())
+}
+
+func LatticeHash(header []byte, nonce uint64, dag *DAG) HashResult {
+	var out HashResult
+
+	nodeCount := dag.NodeCount()
+	if nodeCount == 0 {
+		return out
+	}
+
+	// Round 1: seed mix = sha3_512(header || nonceLE)
 	seedInput := make([]byte, len(header)+8)
 	copy(seedInput, header)
 	binary.LittleEndian.PutUint64(seedInput[len(header):], nonce)
 
 	seed512 := sha3.Sum512(seedInput)
 
+	// mix = first 256 bits
 	var mix [32]byte
 	copy(mix[:], seed512[:32])
 
+	// Round 2: memory-hard traversal
 	var fnvInput [40]byte
 	var blakeInput [64]byte
 
-	for r := uint64(0); r < cfg.ReadsPerHash; r++ {
+	for r := uint64(0); r < dag.spec.ReadsPerHash; r++ {
 		copy(fnvInput[:32], mix[:])
 		binary.LittleEndian.PutUint64(fnvInput[32:], r)
 
-		idx := fnv1a64(fnvInput[:]) % nodeCount
-		node := dag[idx*NodeSize : (idx+1)*NodeSize]
+		nodeIdx := fnv1a64(fnvInput[:]) % nodeCount
+		node := dag.Node(nodeIdx) // zero-copy node view into contiguous DAG
 
+		// mix' = blake3_256((mix XOR node[0:32]) || node[32:64])
 		for i := 0; i < 32; i++ {
 			blakeInput[i] = mix[i] ^ node[i]
 			blakeInput[32+i] = node[32+i]
@@ -279,16 +397,16 @@ func latticeHash(header []byte, nonce uint64, dag []byte, cfg Config) ([32]byte,
 		copy(mix[:], sum[:])
 	}
 
+	// Round 3: final compression = sha3_512(seed || mix)
 	finalInput := make([]byte, 64+32)
 	copy(finalInput[:64], seed512[:])
 	copy(finalInput[64:], mix[:])
 
 	final512 := sha3.Sum512(finalInput)
+	copy(out.Full512[:], final512[:])
+	copy(out.Pow256[:], final512[:32])
 
-	var hash256 [32]byte
-	copy(hash256[:], final512[:32])
-
-	return hash256, final512
+	return out
 }
 
 func fnv1a64(data []byte) uint64 {
@@ -304,7 +422,7 @@ func fnv1a64(data []byte) uint64 {
 	return h
 }
 
-func lessOrEqualBE(a [32]byte, b [32]byte) bool {
+func LessOrEqualBE(a [32]byte, b Target) bool {
 	for i := 0; i < 32; i++ {
 		if a[i] < b[i] {
 			return true
