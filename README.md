@@ -16,7 +16,7 @@ This repository is currently in the **reference-spec and reference-implementatio
 
 The source of truth for Colossus-X is:
 
-- [`spec.md`](./spec.md)
+- [`spec.mdb](./spec.md)
 
 If any code, benchmark, comment, or helper document conflicts with `spec.md`, **`spec.md` wins**.
 
@@ -26,7 +26,7 @@ If any code, benchmark, comment, or helper document conflicts with `spec.md`, **
 - [`REVIEW_CHECKLIST.md`](./REVIEW_CHECKLIST.md): implementation review checklist and rejection gates
 - [`reference/profiles.md`](./reference/profiles.md): profile table and fixed protocol timing
 - [`reference/test_vectors.md`](./reference/test_vectors.md): canonical test-vector format and required vector set
-- [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md): repository layout and implementation staging
+- [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md): implementation guide, repository layout, staging order, and acceptance criteria
 
 ## Design Goals
 
