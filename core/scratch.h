@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "core/epoch_cache.h"
@@ -30,10 +31,15 @@ class LaneScratch {
                                 const Hash256& header_digest,
                                 std::uint64_t nonce,
                                 std::uint32_t lane_id);
+  static LaneScratch InitializeLazy(Profile profile,
+                                    const Hash256& epoch_seed,
+                                    const Hash256& header_digest,
+                                    std::uint64_t nonce,
+                                    std::uint32_t lane_id);
 
   Profile profile() const { return profile_; }
   std::uint32_t lane_id() const { return lane_id_; }
-  std::size_t size_bytes() const { return bytes_.size(); }
+  std::size_t size_bytes() const;
   std::uint64_t unit_count() const;
 
   ScratchUnit ReadUnit(std::uint64_t unit_index) const;
@@ -42,10 +48,18 @@ class LaneScratch {
 
  private:
   LaneScratch(Profile profile, std::uint32_t lane_id, std::vector<std::uint8_t> bytes);
+  LaneScratch(Profile profile,
+              std::uint32_t lane_id,
+              std::array<std::uint64_t, kScratchUnitBytes / sizeof(std::uint64_t)> root_words,
+              std::uint64_t nonce);
 
   Profile profile_;
   std::uint32_t lane_id_;
   std::vector<std::uint8_t> bytes_;
+  bool lazy_ = false;
+  std::array<std::uint64_t, kScratchUnitBytes / sizeof(std::uint64_t)> root_words_{};
+  std::uint64_t lazy_nonce_ = 0;
+  mutable std::unordered_map<std::uint64_t, ScratchUnit> materialized_units_;
 };
 
 Hash256 scratch_integrity_hash(const LaneScratch& scratch);

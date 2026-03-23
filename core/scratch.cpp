@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "core/shake256.h"
@@ -100,20 +101,15 @@ std::uint64_t lane_scratch_unit_count(Profile profile) {
   return lane_scratch_bytes(profile) / kScratchUnitBytes;
 }
 
-ScratchUnit derive_scratch_unit(Profile profile,
-                                const Hash256& epoch_seed,
-                                const Hash256& header_digest,
-                                std::uint64_t nonce,
-                                std::uint32_t lane_id,
-                                std::uint64_t unit_index) {
-  const ProfileParameters& parameters = profile_parameters(profile);
-  if (unit_index >= lane_scratch_unit_count(profile)) {
-    throw std::out_of_range("scratch unit index exceeds per-lane scratch");
-  }
-
-  auto words = scratch_root_words(parameters, epoch_seed, header_digest, nonce, lane_id);
+ScratchUnit derive_scratch_unit_from_root(const ProfileParameters& parameters,
+                                          const std::array<std::uint64_t, kScratchUnitBytes / sizeof(std::uint64_t)>& root_words,
+                                          std::uint64_t nonce,
+                                          std::uint32_t lane_id,
+                                          std::uint64_t unit_index) {
+  auto words = root_words;
+  const std::uint64_t per_lane_scratch_bytes = parameters.scratch_total_bytes / parameters.lanes;
   std::uint64_t running = nonce ^ static_cast<std::uint64_t>(lane_id) ^
-                          (unit_index * kMixConstant0) ^ lane_scratch_bytes(profile);
+                          (unit_index * kMixConstant0) ^ per_lane_scratch_bytes;
 
   for (std::size_t i = 0; i < words.size(); ++i) {
     words[i] ^= rotate_left(unit_index * kMixConstant1 + static_cast<std::uint64_t>(i) * kMixConstant2,
@@ -141,8 +137,33 @@ ScratchUnit derive_scratch_unit(Profile profile,
   return unit;
 }
 
+ScratchUnit derive_scratch_unit(Profile profile,
+                                const Hash256& epoch_seed,
+                                const Hash256& header_digest,
+                                std::uint64_t nonce,
+                                std::uint32_t lane_id,
+                                std::uint64_t unit_index) {
+  const ProfileParameters& parameters = profile_parameters(profile);
+  if (unit_index >= lane_scratch_unit_count(profile)) {
+    throw std::out_of_range("scratch unit index exceeds per-lane scratch");
+  }
+
+  const auto root_words = scratch_root_words(parameters, epoch_seed, header_digest, nonce, lane_id);
+  return derive_scratch_unit_from_root(parameters, root_words, nonce, lane_id, unit_index);
+}
+
 LaneScratch::LaneScratch(Profile profile, std::uint32_t lane_id, std::vector<std::uint8_t> bytes)
     : profile_(profile), lane_id_(lane_id), bytes_(std::move(bytes)) {}
+
+LaneScratch::LaneScratch(Profile profile,
+                         std::uint32_t lane_id,
+                         std::array<std::uint64_t, kScratchUnitBytes / sizeof(std::uint64_t)> root_words,
+                         std::uint64_t nonce)
+    : profile_(profile),
+      lane_id_(lane_id),
+      lazy_(true),
+      root_words_(std::move(root_words)),
+      lazy_nonce_(nonce) {}
 
 LaneScratch LaneScratch::Initialize(Profile profile,
                                     const Hash256& epoch_seed,
@@ -151,8 +172,10 @@ LaneScratch LaneScratch::Initialize(Profile profile,
                                     std::uint32_t lane_id) {
   const std::uint64_t units = lane_scratch_unit_count(profile);
   std::vector<std::uint8_t> bytes(static_cast<std::size_t>(lane_scratch_bytes(profile)), 0U);
+  const ProfileParameters& parameters = profile_parameters(profile);
+  const auto root_words = scratch_root_words(parameters, epoch_seed, header_digest, nonce, lane_id);
   for (std::uint64_t unit_index = 0; unit_index < units; ++unit_index) {
-    const ScratchUnit unit = derive_scratch_unit(profile, epoch_seed, header_digest, nonce, lane_id, unit_index);
+    const ScratchUnit unit = derive_scratch_unit_from_root(parameters, root_words, nonce, lane_id, unit_index);
     const std::size_t offset = byte_offset_for_unit(unit_index);
     for (std::size_t i = 0; i < unit.size(); ++i) {
       bytes[offset + i] = unit[i];
@@ -161,13 +184,39 @@ LaneScratch LaneScratch::Initialize(Profile profile,
   return LaneScratch(profile, lane_id, std::move(bytes));
 }
 
+
+LaneScratch LaneScratch::InitializeLazy(Profile profile,
+                                        const Hash256& epoch_seed,
+                                        const Hash256& header_digest,
+                                        std::uint64_t nonce,
+                                        std::uint32_t lane_id) {
+  const ProfileParameters& parameters = profile_parameters(profile);
+  return LaneScratch(profile, lane_id, scratch_root_words(parameters, epoch_seed, header_digest, nonce, lane_id), nonce);
+}
+
+std::size_t LaneScratch::size_bytes() const {
+  if (lazy_) {
+    return static_cast<std::size_t>(lane_scratch_bytes(profile_));
+  }
+  return bytes_.size();
+}
+
 std::uint64_t LaneScratch::unit_count() const {
-  return static_cast<std::uint64_t>(bytes_.size() / kScratchUnitBytes);
+  return static_cast<std::uint64_t>(size_bytes() / kScratchUnitBytes);
 }
 
 ScratchUnit LaneScratch::ReadUnit(std::uint64_t unit_index) const {
   if (unit_index >= unit_count()) {
     throw std::out_of_range("scratch read exceeds per-lane scratch");
+  }
+  if (lazy_) {
+    const auto found = materialized_units_.find(unit_index);
+    if (found != materialized_units_.end()) {
+      return found->second;
+    }
+    const ScratchUnit unit = derive_scratch_unit_from_root(profile_parameters(profile_), root_words_, lazy_nonce_, lane_id_, unit_index);
+    materialized_units_.emplace(unit_index, unit);
+    return unit;
   }
   ScratchUnit unit{};
   const std::size_t offset = byte_offset_for_unit(unit_index);
@@ -180,6 +229,10 @@ ScratchUnit LaneScratch::ReadUnit(std::uint64_t unit_index) const {
 void LaneScratch::WriteUnit(std::uint64_t unit_index, const ScratchUnit& unit) {
   if (unit_index >= unit_count()) {
     throw std::out_of_range("scratch write exceeds per-lane scratch");
+  }
+  if (lazy_) {
+    materialized_units_[unit_index] = unit;
+    return;
   }
   const std::size_t offset = byte_offset_for_unit(unit_index);
   for (std::size_t i = 0; i < unit.size(); ++i) {
