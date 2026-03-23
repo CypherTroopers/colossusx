@@ -32,12 +32,30 @@ const ProfileParameters& profile_parameters(Profile profile);
 
 using EpochCache = std::vector<std::uint8_t>;
 
+class ScopedEpochCacheOverride {
+ public:
+  ScopedEpochCacheOverride(Profile profile,
+                           const Hash256& epoch_seed,
+                           const EpochCache* cache);
+  ~ScopedEpochCacheOverride();
+
+  ScopedEpochCacheOverride(const ScopedEpochCacheOverride&) = delete;
+  ScopedEpochCacheOverride& operator=(const ScopedEpochCacheOverride&) = delete;
+
+ private:
+  bool active_ = false;
+};
+
 EpochCache build_epoch_cache(Profile profile, const Hash256& epoch_seed);
 void rebuild_epoch_cache(Profile profile, const Hash256& epoch_seed, EpochCache* cache);
 std::vector<std::uint8_t> epoch_cache_slice(Profile profile,
                                             const Hash256& epoch_seed,
                                             std::uint64_t offset,
                                             std::size_t length);
+std::uint64_t epoch_cache_word(Profile profile,
+                               const Hash256& epoch_seed,
+                               std::uint64_t cache_word_index);
+bool epoch_cache_override_active(Profile profile, const Hash256& epoch_seed);
 
 }  // namespace colossusx
 

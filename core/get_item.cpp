@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "core/shake256.h"
@@ -67,9 +68,20 @@ std::array<std::uint64_t, kDatasetItemBytes / sizeof(std::uint64_t)> initial_ite
 std::uint64_t load_cache_tap_word(Profile profile,
                                   const Hash256& epoch_seed,
                                   std::uint64_t cache_word_index) {
-  const std::vector<std::uint8_t> bytes =
-      epoch_cache_slice(profile, epoch_seed, cache_word_index * sizeof(std::uint64_t), sizeof(std::uint64_t));
-  return load_u64_le(bytes.data());
+  return epoch_cache_word(profile, epoch_seed, cache_word_index);
+}
+
+
+struct ItemMemoEntry {
+  bool initialized = false;
+  Profile profile = Profile::kCx18;
+  Hash256 epoch_seed{};
+  std::unordered_map<std::uint64_t, DatasetItem> items;
+};
+
+ItemMemoEntry& item_memo() {
+  static ItemMemoEntry memo;
+  return memo;
 }
 
 }  // namespace
@@ -83,6 +95,21 @@ std::uint64_t dataset_item_count(Profile profile) {
 }
 
 DatasetItem get_item(Profile profile, const Hash256& epoch_seed, std::uint64_t item_index) {
+  const bool use_memo = !epoch_cache_override_active(profile, epoch_seed);
+  ItemMemoEntry& memo = item_memo();
+  if (use_memo && (!memo.initialized || memo.profile != profile || memo.epoch_seed != epoch_seed)) {
+    memo.initialized = true;
+    memo.profile = profile;
+    memo.epoch_seed = epoch_seed;
+    memo.items.clear();
+  }
+  if (use_memo) {
+    const auto found = memo.items.find(item_index);
+    if (found != memo.items.end()) {
+      return found->second;
+    }
+  }
+
   const ProfileParameters& parameters = profile_parameters(profile);
   if (parameters.item_size_bytes != kDatasetItemBytes) {
     throw std::invalid_argument("profile item size does not match reference item size");
@@ -145,6 +172,9 @@ DatasetItem get_item(Profile profile, const Hash256& epoch_seed, std::uint64_t i
   DatasetItem item{};
   for (std::size_t i = 0; i < kWordCount; ++i) {
     store_u64_le(state[i], &item[i * sizeof(std::uint64_t)]);
+  }
+  if (use_memo) {
+    memo.items.emplace(item_index, item);
   }
   return item;
 }

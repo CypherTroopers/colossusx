@@ -105,7 +105,77 @@ void validate_cache_geometry(const ProfileParameters& parameters) {
   }
 }
 
+
+
+struct CacheOverrideState {
+  bool active = false;
+  Profile profile = Profile::kCx18;
+  Hash256 epoch_seed{};
+  const EpochCache* cache = nullptr;
+};
+
+CacheOverrideState& cache_override_state() {
+  static thread_local CacheOverrideState state;
+  return state;
+}
+
+const EpochCache* active_epoch_cache_override(Profile profile, const Hash256& epoch_seed) {
+  CacheOverrideState& state = cache_override_state();
+  if (!state.active || state.profile != profile || state.epoch_seed != epoch_seed) {
+    return nullptr;
+  }
+  return state.cache;
+}
+
+struct CacheMemoEntry {
+  bool initialized = false;
+  Profile profile = Profile::kCx18;
+  Hash256 epoch_seed{};
+  EpochCache cache;
+};
+
+const EpochCache& memoized_epoch_cache(Profile profile, const Hash256& epoch_seed) {
+  if (const EpochCache* override_cache = active_epoch_cache_override(profile, epoch_seed)) {
+    return *override_cache;
+  }
+
+  static CacheMemoEntry memo;
+  if (!memo.initialized || memo.profile != profile || memo.epoch_seed != epoch_seed) {
+    memo.profile = profile;
+    memo.epoch_seed = epoch_seed;
+    rebuild_epoch_cache(profile, epoch_seed, &memo.cache);
+    memo.initialized = true;
+  }
+  return memo.cache;
+}
+
 }  // namespace
+
+ScopedEpochCacheOverride::ScopedEpochCacheOverride(Profile profile,
+                                                 const Hash256& epoch_seed,
+                                                 const EpochCache* cache) {
+  if (cache == nullptr) {
+    return;
+  }
+  CacheOverrideState& state = cache_override_state();
+  if (state.active) {
+    throw std::logic_error("nested epoch cache overrides are not supported");
+  }
+  state.active = true;
+  state.profile = profile;
+  state.epoch_seed = epoch_seed;
+  state.cache = cache;
+  active_ = true;
+}
+
+ScopedEpochCacheOverride::~ScopedEpochCacheOverride() {
+  if (!active_) {
+    return;
+  }
+  CacheOverrideState& state = cache_override_state();
+  state.active = false;
+  state.cache = nullptr;
+}
 
 const ProfileParameters& profile_parameters(Profile profile) {
   switch (profile) {
@@ -152,23 +222,29 @@ std::vector<std::uint8_t> epoch_cache_slice(Profile profile,
     throw std::out_of_range("cache slice exceeds cache size");
   }
 
+  const EpochCache& cache = memoized_epoch_cache(profile, epoch_seed);
   std::vector<std::uint8_t> output(length);
-  std::size_t written = 0;
-  while (written < length) {
-    const std::uint64_t absolute_offset = offset + written;
-    const std::uint64_t block_index = absolute_offset / kEpochCacheBlockBytes;
-    const std::size_t in_block_offset =
-        static_cast<std::size_t>(absolute_offset % kEpochCacheBlockBytes);
-    const std::array<std::uint8_t, kEpochCacheBlockBytes> block =
-        generate_cache_block(parameters, epoch_seed, block_index);
-    const std::size_t to_copy =
-        std::min(length - written, kEpochCacheBlockBytes - in_block_offset);
-    std::copy(block.begin() + in_block_offset,
-              block.begin() + in_block_offset + to_copy,
-              output.begin() + written);
-    written += to_copy;
-  }
+  std::copy(cache.begin() + static_cast<std::ptrdiff_t>(offset),
+            cache.begin() + static_cast<std::ptrdiff_t>(offset + length),
+            output.begin());
   return output;
+}
+
+bool epoch_cache_override_active(Profile profile, const Hash256& epoch_seed) {
+  return active_epoch_cache_override(profile, epoch_seed) != nullptr;
+}
+
+std::uint64_t epoch_cache_word(Profile profile,
+                               const Hash256& epoch_seed,
+                               std::uint64_t cache_word_index) {
+  const ProfileParameters& parameters = profile_parameters(profile);
+  validate_cache_geometry(parameters);
+  const std::uint64_t byte_offset = cache_word_index * sizeof(std::uint64_t);
+  if (byte_offset + sizeof(std::uint64_t) > parameters.cache_size_bytes) {
+    throw std::out_of_range("cache word exceeds cache size");
+  }
+  const EpochCache& cache = memoized_epoch_cache(profile, epoch_seed);
+  return load_u64_le(cache.data() + byte_offset);
 }
 
 }  // namespace colossusx
